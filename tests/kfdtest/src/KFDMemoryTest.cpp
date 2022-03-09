@@ -32,6 +32,7 @@
 #include <signal.h>
 #include <numa.h>
 #include <vector>
+#include <dlfcn.h>
 #include "Dispatch.hpp"
 #include "PM4Queue.hpp"
 #include "PM4Packet.hpp"
@@ -2585,6 +2586,158 @@ TEST_F(KFDMemoryTest, VA_VRAM_Only_AllocTest) {
                                mapFlags, 1, reinterpret_cast<HSAuint32 *>(&defaultGPUNode)));
 
     ASSERT_SUCCESS(hsaKmtFreeMemory(buf, PAGE_SIZE));
+
+    TEST_END
+}
+
+/* CPU mapping helper for BO
+ *
+ * amdgpu_bo_cpu_map doesn't support mapping at a fixed address. This helper
+ * implements it manually. Uses dlsym to look up amdgpu_device_get_fd to
+ * avoid compile time dependency on new libdrm.
+ */
+static void *mmap_bo(HsaAMDGPUDeviceHandle amdgpu_dev, amdgpu_bo_handle bo,
+                     void *addr, size_t length, int prot, int flags)
+{
+    static int (*fn_amdgpu_device_get_fd)(HsaAMDGPUDeviceHandle device_handle);
+
+    if (!fn_amdgpu_device_get_fd) {
+        char *error;
+
+        fn_amdgpu_device_get_fd = (int (*)(HsaAMDGPUDeviceHandle device_handle))dlsym(RTLD_DEFAULT, "amdgpu_device_get_fd");
+        if ((error = dlerror()) != NULL) {
+            LOG() << "amdgpu_device_get_fd is not available: " << error << std::endl;
+            return MAP_FAILED;
+        }
+    }
+
+    int renderFd = fn_amdgpu_device_get_fd(amdgpu_dev);
+    if (renderFd < 0) {
+        LOG() << "Failed to get render node FD" << std::endl;
+        return MAP_FAILED;
+    }
+
+    uint32_t gem_handle = 0;
+    if (amdgpu_bo_export(bo, amdgpu_bo_handle_type_kms, &gem_handle)) {
+        LOG() << "Failed to get GEM handle" << std::endl;
+        return MAP_FAILED;
+    }
+
+    union drm_amdgpu_gem_mmap args;
+    memset(&args, 0, sizeof(args));
+    /* Query the buffer address (args.addr_ptr).
+     * The kernel driver ignores the offset and size parameters. */
+    args.in.handle = gem_handle;
+    if (drmCommandWriteRead(renderFd, DRM_AMDGPU_GEM_MMAP, &args, sizeof(args))) {
+        LOG() << "Failed to get mmap offset" << std::endl;
+        return MAP_FAILED;
+    }
+
+    return mmap(addr, length, prot, flags, renderFd, args.out.addr_ptr);
+}
+
+TEST_F(KFDMemoryTest, DrmMap) {
+    TEST_REQUIRE_ENV_CAPABILITIES(ENVCAPS_64BITLINUX);
+    TEST_START(TESTPROFILE_RUNALL);
+
+    if (m_VersionInfo.KernelInterfaceMinorVersion < 12) {
+        LOG() << "Skipping test, requires KFD ioctl version 1.12 or newer" << std::endl;
+        return;
+    }
+
+    if (m_FamilyId < FAMILY_AI) {
+        LOG() << "Skipping test: Test requires gfx9 and later asics." << std::endl;
+        return;
+    }
+
+    int defaultGPUNode = m_NodeInfo.HsaDefaultGPUNode();
+    ASSERT_GE(defaultGPUNode, 0) << "failed to get default GPU Node";
+
+    HsaAMDGPUDeviceHandle amdgpu_dev;
+    if (hsaKmtGetAMDGPUDeviceHandle(defaultGPUNode, &amdgpu_dev) != HSAKMT_STATUS_SUCCESS) {
+        LOG() << "No amdgpu_device handle found, skipping the test" << std::endl;
+        return;
+    }
+
+    HsaMemFlags memFlags = m_MemoryFlags;
+    memFlags.ui32.NonPaged = 1;
+    memFlags.ui32.HostAccess = 0;
+
+    HSAuint32 *buf;
+    /*alloc vram without va assigned*/
+    memFlags.ui32.OnlyAddress = 0;
+    memFlags.ui32.NoAddress = 1;
+    ASSERT_SUCCESS(hsaKmtAllocMemory(defaultGPUNode, PAGE_SIZE, memFlags,
+                                          reinterpret_cast<void**>(&buf)));
+
+    // Export DMABuf handle
+    int dmabuf_fd;
+    HSAuint64 offset;
+    ASSERT_SUCCESS(hsaKmtExportDMABufHandle(buf, PAGE_SIZE, &dmabuf_fd, &offset));
+    ASSERT_EQ(0, offset);
+
+    // Import into libdrm
+    struct amdgpu_bo_import_result import;
+    amdgpu_bo_import((struct amdgpu_device *)amdgpu_dev, amdgpu_bo_handle_type_dma_buf_fd, dmabuf_fd, &import);
+    amdgpu_bo_handle bo = import.buf_handle;
+    ASSERT_EQ(PAGE_SIZE, import.alloc_size);
+
+    // Don't need dmabuf_fd from now, close it
+    ASSERT_EQ(0, close(dmabuf_fd));
+
+    // alloc va without vram alloc
+    HSAuint32 *addr;
+    memFlags.ui32.OnlyAddress = 1;
+    memFlags.ui32.NoAddress = 0;
+    ASSERT_SUCCESS(hsaKmtAllocMemory(defaultGPUNode, PAGE_SIZE, memFlags,
+                                          reinterpret_cast<void**>(&addr)));
+
+    // map the BO using GEM API at new virtual address reserved above
+    ASSERT_EQ(0, amdgpu_bo_va_op(bo, 0, PAGE_SIZE, (uint64_t)(unsigned long)addr, 0, AMDGPU_VA_OP_MAP));
+
+    // map the buffer to cpu VM with same VA
+    int prot = memFlags.ui32.HostAccess ? PROT_READ | PROT_WRITE :
+                                          PROT_NONE;
+    void *ret = mmap_bo(amdgpu_dev, bo, addr, PAGE_SIZE, prot,
+                        MAP_SHARED | MAP_FIXED);
+    ASSERT_EQ(ret, addr);
+
+    // test accessing the BO from the GPU
+    PM4Queue pm4Queue;
+    ASSERT_SUCCESS(pm4Queue.Create(defaultGPUNode));
+    HsaMemoryBuffer sysBuffer(PAGE_SIZE, defaultGPUNode);
+    HSAuint32 *sys = sysBuffer.As<HSAuint32*>();
+
+    HsaMemoryBuffer isaBuffer(PAGE_SIZE, defaultGPUNode, true/*zero*/, false/*local*/, true/*exec*/);
+
+    ASSERT_SUCCESS(m_pAsm->RunAssembleBuf(CopyDwordIsa, isaBuffer.As<char*>()));
+
+    // copy from system memory to drm-mapped VRAM and back
+    sys[0] = 0xdeadbeef;
+    sys[1] = 0;
+    Dispatch dispatch1(isaBuffer);
+    dispatch1.SetArgs(sys, addr);
+    dispatch1.Submit(pm4Queue);
+    dispatch1.Sync(g_TestTimeOut);
+
+    Dispatch dispatch2(isaBuffer);
+    dispatch2.SetArgs(addr, &sys[0]);
+    dispatch2.Submit(pm4Queue);
+    dispatch2.Sync(g_TestTimeOut);
+    ASSERT_EQ(0xdeadbeef, sys[0]);
+    ASSERT_SUCCESS(pm4Queue.Destroy());
+
+    // unmap the BO from CPU VM
+    ASSERT_EQ(0, munmap(addr, PAGE_SIZE));
+    // unmap the BO using GEM API
+    ASSERT_EQ(0, amdgpu_bo_va_op(bo, 0, PAGE_SIZE, (uint64_t)(unsigned long)addr, 0, AMDGPU_VA_OP_UNMAP));
+
+    // clean up
+    amdgpu_bo_free(bo);
+
+    // free buffer handle and GPU VA
+    ASSERT_SUCCESS(hsaKmtFreeMemory(buf, PAGE_SIZE));
+    ASSERT_SUCCESS(hsaKmtFreeMemory(addr, PAGE_SIZE));
 
     TEST_END
 }
