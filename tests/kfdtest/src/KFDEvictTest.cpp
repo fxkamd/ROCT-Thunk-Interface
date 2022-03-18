@@ -41,6 +41,14 @@ void KFDEvictTest::SetUp() {
 
     KFDBaseComponentTest::SetUp();
 
+    if (GetParam()) {
+        HSAuint32 defaultGPUNode = m_NodeInfo.HsaDefaultGPUNode();
+        ASSERT_GE(defaultGPUNode, 0) << "failed to get default GPU Node";
+
+        if (hsaKmtGetAMDGPUDeviceHandle(defaultGPUNode, &m_amdgpu_dev) != HSAKMT_STATUS_SUCCESS)
+            m_amdgpu_dev = NULL;
+    }
+
     ROUTINE_END
 }
 
@@ -53,7 +61,7 @@ void KFDEvictTest::TearDown() {
 }
 
 void KFDEvictTest::AllocBuffers(HSAuint32 defaultGPUNode, HSAuint32 count, HSAuint64 vramBufSize,
-                                std::vector<void *> &pBuffers) {
+                                std::vector<BufferHandles> &buffers) {
     HSAuint64   totalMB;
 
     totalMB = N_PROCESSES*count*(vramBufSize>>20);
@@ -62,27 +70,55 @@ void KFDEvictTest::AllocBuffers(HSAuint32 defaultGPUNode, HSAuint32 count, HSAui
               << totalMB << ")MB VRAM in KFD" << std::endl;
     }
 
+    HsaMemFlags memFlags = {0};
     HsaMemMapFlags mapFlags = {0};
     HSAKMT_STATUS ret;
     HSAuint32 retry = 0;
 
-    m_Flags.Value = 0;
-    m_Flags.ui32.PageSize = HSA_PAGE_SIZE_4KB;
-    m_Flags.ui32.HostAccess = 0;
-    m_Flags.ui32.NonPaged = 1;
+    memFlags.Value = 0;
+    memFlags.ui32.PageSize = HSA_PAGE_SIZE_4KB;
+    memFlags.ui32.HostAccess = 0;
+    memFlags.ui32.NonPaged = 1;
 
     for (HSAuint32 i = 0; i < count; ) {
-        ret = hsaKmtAllocMemory(defaultGPUNode, vramBufSize, m_Flags, &m_pBuf);
+        BufferHandles buf;
+
+        if (is_dgpu() && GetParam()) {
+            // alloc vram without va assigned
+            memFlags.ui32.OnlyAddress = 0;
+            memFlags.ui32.NoAddress = 1;
+        }
+        ret = hsaKmtAllocMemory(defaultGPUNode, vramBufSize, memFlags, &buf.hsakmt_handle);
         if (ret == HSAKMT_STATUS_SUCCESS) {
-            if (is_dgpu()) {
-                if (hsaKmtMapMemoryToGPUNodes(m_pBuf, vramBufSize, NULL,
+            if (is_dgpu() && !GetParam()) {
+                if (hsaKmtMapMemoryToGPUNodes(buf.hsakmt_handle, vramBufSize, NULL,
                        mapFlags, 1, reinterpret_cast<HSAuint32 *>(&defaultGPUNode)) == HSAKMT_STATUS_ERROR) {
-                    EXPECT_SUCCESS(hsaKmtFreeMemory(m_pBuf, vramBufSize));
+                    EXPECT_SUCCESS(hsaKmtFreeMemory(buf.hsakmt_handle, vramBufSize));
                     LOG() << "Map failed for " << i << "/" << count << " buffer. Retrying allocation" << std::endl;
                     goto retry;
                 }
+                buf.vaddr = buf.hsakmt_handle;
+            } else if (is_dgpu() && GetParam()) {
+                // alloc va without vram allocation
+                memFlags.ui32.OnlyAddress = 1;
+                memFlags.ui32.NoAddress = 0;
+                ASSERT_SUCCESS(hsaKmtAllocMemory(defaultGPUNode, vramBufSize,
+                                                 memFlags, &buf.vaddr));
+
+                int dmabuf_fd;
+                HSAuint64 offset;
+                struct amdgpu_bo_import_result import;
+
+                ASSERT_SUCCESS(hsaKmtExportDMABufHandle(buf.hsakmt_handle, vramBufSize, &dmabuf_fd, &offset));
+                ASSERT_EQ(0, offset);
+                ASSERT_EQ(0, amdgpu_bo_import((amdgpu_device *)m_amdgpu_dev, amdgpu_bo_handle_type_dma_buf_fd, dmabuf_fd, &import));
+                close(dmabuf_fd);
+
+                ASSERT_EQ(0, amdgpu_bo_va_op(import.buf_handle, 0, vramBufSize,
+                                             (unsigned long)buf.vaddr, 0, AMDGPU_VA_OP_MAP));
+                buf.amdgpu_handle = import.buf_handle;
             }
-            pBuffers.push_back(m_pBuf);
+            buffers.push_back(buf);
 
             i++;
             retry = 0;
@@ -98,14 +134,18 @@ retry:
     }
 }
 
-void KFDEvictTest::FreeBuffers(std::vector<void *> &pBuffers, HSAuint64 vramBufSize) {
-    for (HSAuint32 i = 0; i < pBuffers.size(); i++) {
-        m_pBuf = pBuffers[i];
-        if (m_pBuf != NULL) {
-            if (is_dgpu())
-                EXPECT_SUCCESS(hsaKmtUnmapMemoryToGPU(m_pBuf));
-            EXPECT_SUCCESS(hsaKmtFreeMemory(m_pBuf, vramBufSize));
+void KFDEvictTest::FreeBuffers(std::vector<BufferHandles> &buffers,
+                               HSAuint64 vramBufSize) {
+    for (auto &buf : buffers) {
+        if (is_dgpu() && !GetParam()) {
+            EXPECT_SUCCESS(hsaKmtUnmapMemoryToGPU(buf.vaddr));
+        } else if (is_dgpu() && GetParam()) {
+            EXPECT_EQ(0, amdgpu_bo_va_op(buf.amdgpu_handle, 0, vramBufSize,
+                                         (unsigned long)buf.vaddr, 0, AMDGPU_VA_OP_UNMAP));
+            EXPECT_EQ(0, amdgpu_bo_free(buf.amdgpu_handle));
+            EXPECT_SUCCESS(hsaKmtFreeMemory(buf.vaddr, vramBufSize));
         }
+        EXPECT_SUCCESS(hsaKmtFreeMemory(buf.hsakmt_handle, vramBufSize));
     }
 }
 
@@ -302,9 +342,19 @@ void KFDEvictTest::AmdgpuCommandSubmissionSdmaNop(int rn, amdgpu_bo_handle handl
  *    - Synchronization between the processes, so they know for sure when
  *        they are done allocating memory
  */
-TEST_F(KFDEvictTest, BasicTest) {
+TEST_P(KFDEvictTest, BasicTest) {
     TEST_REQUIRE_ENV_CAPABILITIES(ENVCAPS_64BITLINUX);
     TEST_START(TESTPROFILE_RUNALL);
+
+    if (GetParam() && m_VersionInfo.KernelInterfaceMinorVersion < 12) {
+        LOG() << "Skipping test, requires KFD ioctl version 1.12 or newer" << std::endl;
+        return;
+    }
+
+    if (GetParam() && !m_amdgpu_dev) {
+        LOG() << "No amdgpu_device handle found, skipping the test" << std::endl;
+        return;
+    }
 
     HSAuint32 defaultGPUNode = m_NodeInfo.HsaDefaultGPUNode();
     ASSERT_GE(defaultGPUNode, 0) << "failed to get default GPU Node";
@@ -340,8 +390,8 @@ TEST_F(KFDEvictTest, BasicTest) {
         return;
     }
 
-    std::vector<void *> pBuffers;
-    AllocBuffers(defaultGPUNode, count, vramBufSize, pBuffers);
+    std::vector<BufferHandles> buffers;
+    AllocBuffers(defaultGPUNode, count, vramBufSize, buffers);
 
     /* Allocate gfx vram size of at most one third system memory */
     HSAuint64 size = sysMemSize / 3 < testSize / 2 ? sysMemSize / 3 : testSize / 2;
@@ -352,7 +402,7 @@ TEST_F(KFDEvictTest, BasicTest) {
 
     FreeAmdgpuBo(handle);
     LOG() << m_psName << "free buffer" << std::endl;
-    FreeBuffers(pBuffers, vramBufSize);
+    FreeBuffers(buffers, vramBufSize);
 
     WaitChildProcesses();
 
@@ -376,9 +426,19 @@ TEST_F(KFDEvictTest, BasicTest) {
  *    - notify shader to quit
  *    - check result buffer with specific value to confirm all wavefronts quit normally
  */
-TEST_F(KFDEvictTest, QueueTest) {
+TEST_P(KFDEvictTest, QueueTest) {
     TEST_REQUIRE_ENV_CAPABILITIES(ENVCAPS_64BITLINUX);
     TEST_START(TESTPROFILE_RUNALL)
+
+    if (GetParam() && m_VersionInfo.KernelInterfaceMinorVersion < 12) {
+        LOG() << "Skipping test, requires KFD ioctl version 1.12 or newer" << std::endl;
+        return;
+    }
+
+    if (GetParam() && !m_amdgpu_dev) {
+        LOG() << "No amdgpu_device handle found, skipping the test" << std::endl;
+        return;
+    }
 
     HSAuint32 defaultGPUNode = m_NodeInfo.HsaDefaultGPUNode();
     ASSERT_GE(defaultGPUNode, 0) << "failed to get default GPU Node";
@@ -438,22 +498,22 @@ TEST_F(KFDEvictTest, QueueTest) {
 
     Dispatch dispatch0(isaBuffer);
 
-    std::vector<void *> pBuffers;
-    AllocBuffers(defaultGPUNode, count, vramBufSize, pBuffers);
+    std::vector<BufferHandles> buffers;
+    AllocBuffers(defaultGPUNode, count, vramBufSize, buffers);
 
     /* Allocate gfx vram size of at most one third system memory */
     HSAuint64 size = sysMemSize / 3 < testSize / 2 ? sysMemSize / 3 : testSize / 2;
     amdgpu_bo_handle handle;
     AllocAmdgpuBo(rn, size, handle);
 
-    unsigned int wavefront_num = pBuffers.size();
+    unsigned int wavefront_num = buffers.size();
     LOG() << m_psName << "wavefront number " << wavefront_num << std::endl;
 
     void **localBufAddr = addrBuffer.As<void **>();
     unsigned int *result = resultBuffer.As<uint32_t *>();
 
     for (i = 0; i < wavefront_num; i++)
-        *(localBufAddr + i) = pBuffers[i];
+        *(localBufAddr + i) = buffers[i].vaddr;
 
     dispatch0.SetArgs(localBufAddr, result);
     dispatch0.SetDim(wavefront_num, 1, 1);
@@ -479,7 +539,7 @@ TEST_F(KFDEvictTest, QueueTest) {
     // LOG() << m_psName << "free buffer" << std::endl;
 
     /* Cleanup */
-    FreeBuffers(pBuffers, vramBufSize);
+    FreeBuffers(buffers, vramBufSize);
 
     /* Check if all wavefronts finished successfully */
     for (i = 0; i < wavefront_num; i++)
@@ -496,9 +556,19 @@ TEST_F(KFDEvictTest, QueueTest) {
  * eviction optimization in KFD that leaves idle processes evicted
  * until the next time the doorbell page is accessed.
  */
-TEST_F(KFDEvictTest, BurstyTest) {
+TEST_P(KFDEvictTest, BurstyTest) {
     TEST_REQUIRE_ENV_CAPABILITIES(ENVCAPS_64BITLINUX);
     TEST_START(TESTPROFILE_RUNALL);
+
+    if (GetParam() && m_VersionInfo.KernelInterfaceMinorVersion < 12) {
+        LOG() << "Skipping test, requires KFD ioctl version 1.12 or newer" << std::endl;
+        return;
+    }
+
+    if (GetParam() && !m_amdgpu_dev) {
+        LOG() << "No amdgpu_device handle found, skipping the test" << std::endl;
+        return;
+    }
 
     HSAuint32 defaultGPUNode = m_NodeInfo.HsaDefaultGPUNode();
     ASSERT_GE(defaultGPUNode, 0) << "failed to get default GPU Node";
@@ -537,8 +607,8 @@ TEST_F(KFDEvictTest, BurstyTest) {
     PM4Queue pm4Queue;
     ASSERT_SUCCESS(pm4Queue.Create(defaultGPUNode));
 
-    std::vector<void *> pBuffers;
-    AllocBuffers(defaultGPUNode, count, vramBufSize, pBuffers);
+    std::vector<BufferHandles> buffers;
+    AllocBuffers(defaultGPUNode, count, vramBufSize, buffers);
 
     /* Allocate gfx vram size of at most one third system memory */
     HSAuint64 size = sysMemSize / 3 < testSize / 2 ? sysMemSize / 3 : testSize / 2;
@@ -549,7 +619,7 @@ TEST_F(KFDEvictTest, BurstyTest) {
 
     FreeAmdgpuBo(handle);
     LOG() << m_psName << "free buffer" << std::endl;
-    FreeBuffers(pBuffers, vramBufSize);
+    FreeBuffers(buffers, vramBufSize);
 
     EXPECT_SUCCESS(pm4Queue.Destroy());
 
@@ -557,3 +627,5 @@ TEST_F(KFDEvictTest, BurstyTest) {
 
     TEST_END
 }
+
+INSTANTIATE_TEST_CASE_P(, KFDEvictTest, ::testing::Bool());

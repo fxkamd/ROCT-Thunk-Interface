@@ -31,26 +31,32 @@
 
 // @class KFDEvictTest
 // Test eviction and restore procedure using two processes
-class KFDEvictTest :  public KFDMultiProcessTest {
+class KFDEvictTest :  public KFDMultiProcessTest, public ::testing::WithParamInterface<bool> {
  public:
     KFDEvictTest(void) {}
     ~KFDEvictTest(void) {}
 
  protected:
+    struct BufferHandles {
+        void *vaddr;
+        void *hsakmt_handle;
+        amdgpu_bo_handle amdgpu_handle;
+    };
+
     virtual void SetUp();
     virtual void TearDown();
 
     void AllocBuffers(HSAuint32 defaultGPUNode, HSAuint32 count, HSAuint64 vramBufSize,
-                      std::vector<void *> &pBuffers);
-    void FreeBuffers(std::vector<void *> &pBuffers, HSAuint64 vramBufSize);
+                      std::vector<BufferHandles> &buffers);
+    void FreeBuffers(std::vector<BufferHandles> &buffers,
+                     HSAuint64 vramBufSize);
     void AllocAmdgpuBo(int rn, HSAuint64 vramBufSize, amdgpu_bo_handle &handle);
     void FreeAmdgpuBo(amdgpu_bo_handle handle);
     void AmdgpuCommandSubmissionSdmaNop(int rn, amdgpu_bo_handle handle,
                                            PM4Queue *computeQueue);
 
  protected:  // Members
-    HsaMemFlags     m_Flags;
-    void*           m_pBuf;
+    HsaAMDGPUDeviceHandle m_amdgpu_dev;
 };
 
 #endif  // __KFD_EVICT_TEST__H__
