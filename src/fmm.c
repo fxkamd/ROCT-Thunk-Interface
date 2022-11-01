@@ -769,12 +769,21 @@ static void *mmap_aperture_allocate_aligned(manageable_aperture_t *aper,
 	uint64_t alignment_size = PAGE_SIZE << svm.alignment_order;
 	uint64_t guard_size;
 
-	if (address)
-		return NULL;
-
 	if (!aper->is_cpu_accessible) {
 		pr_err("MMap Aperture must be CPU accessible\n");
 		return NULL;
+	}
+
+	if (address) {
+		void *addr = mmap(address, size, PROT_NONE,
+			MAP_ANONYMOUS | MAP_NORESERVE | MAP_PRIVATE | MAP_FIXED_NOREPLACE,
+			-1, 0);
+
+		if (addr == MAP_FAILED) {
+			pr_err("mmap failed: %s\n", strerror(errno));
+			return NULL;
+		}
+		return addr;
 	}
 
 	/* Align big buffers to the next power-of-2. By default, the max alignment
