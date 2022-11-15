@@ -595,3 +595,11 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtSetMemoryUserData(const void *Pointer,
 
 	return fmm_set_mem_user_data(Pointer, UserData);
 }
+
+HSAKMT_STATUS HSAKMTAPI hsaKmtGetAMDGPUDeviceHandle( HSAuint32 NodeId,
+						HsaAMDGPUDeviceHandle   *DeviceHandle)
+{
+	CHECK_KFD_OPEN();
+
+	return fmm_get_amdgpu_device_handle(NodeId, DeviceHandle);
+}
