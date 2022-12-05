@@ -311,8 +311,10 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtRegisterGraphicsHandleToNodes(HSAuint64 GraphicsRe
 
 	pr_debug("[%s] number of nodes %lu\n", __func__, NumberOfNodes);
 
-	ret = validate_nodeid_array(&gpu_id_array,
-			NumberOfNodes, NodeArray);
+	if (NodeArray != NULL || NumberOfNodes != 0) {
+		ret = validate_nodeid_array(&gpu_id_array,
+				NumberOfNodes, NodeArray);
+	}
 
 	if (ret == HSAKMT_STATUS_SUCCESS) {
 		ret = fmm_register_graphics_handle(
